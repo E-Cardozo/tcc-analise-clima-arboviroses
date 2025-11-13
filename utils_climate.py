@@ -8,6 +8,7 @@ Código: 836463
 """
 
 import time
+import traceback
 import pandas as pd
 import requests
 import zipfile
@@ -238,76 +239,195 @@ class ClimateDataProcessor:
     @staticmethod
     def processar_arquivo_climatico(nome_arquivo: str, conteudo: str, ano_alvo: int) -> Optional[pd.DataFrame]:
         """
-        Processa arquivo CSV individual do INMET
+        Processa arquivo CSV individual do INMET com suporte para formatos problemáticos anteriores a 2019.
         
         Args:
-            nome_arquivo: Nome do arquivo
-            conteudo: Conteúdo do arquivo
-            ano_alvo: Ano para filtro
+            nome_arquivo (str): O nome do arquivo que está sendo processado.
+            conteudo (str): O conteúdo textual (CSV) do arquivo.
+            ano_alvo (int): O ano de referência para filtrar os dados.
             
         Returns:
-            DataFrame processado ou None se erro
+            Optional[pd.DataFrame]: Um DataFrame agregado mensalmente ou None se o processamento falhar.
         """
         try:
             from io import StringIO
             
-            df = pd.read_csv(
-                StringIO(conteudo), 
-                sep=';', 
-                skiprows=8, 
-                decimal=',', 
-                encoding='latin-1',
-                on_bad_lines='skip',
-                header=0
-            )
-
-            df = df.rename(columns={
-                'Data': 'data',
-                'PRECIPITAÇÃO TOTAL, HORÁRIO (mm)': 'precipitacao_mm',
-                'TEMPERATURA DO AR - BULBO SECO, HORARIA (°C)': 'temperatura_c',
-                'UMIDADE RELATIVA DO AR, HORARIA (%)': 'umidade_percentual'
-            })
+            formato_antigo = ano_alvo < 2019
             
-            colunas_relevantes = ['data', 'precipitacao_mm', 'temperatura_c', 'umidade_percentual']
-            colunas_existentes = [col for col in colunas_relevantes if col in df.columns]
-
-            if 'data' not in colunas_existentes:
-                logger.warning(f"Coluna 'Data' não encontrada em {nome_arquivo}, pulando.")
+            if formato_antigo:
+                try:
+                    df = pd.read_csv(
+                        StringIO(conteudo),
+                        sep=';',
+                        skiprows=8,
+                        decimal=',',
+                        encoding='latin-1',
+                        on_bad_lines='skip',
+                        header=0,
+                        low_memory=False
+                    )
+                    
+                    if len(df.columns) == 1 and any(';' in str(val) for val in df.iloc[:, 0].dropna().head()):
+                        logger.info(f"Dividindo colunas concatenadas: {nome_arquivo}")
+                        
+                        dados_divididos = df.iloc[:, 0].str.split(';', expand=True)
+                        
+                        if not dados_divididos.empty:
+                            novos_cabecalhos = dados_divididos.iloc[0].str.strip()
+                            dados_divididos = dados_divididos[1:]
+                            dados_divididos.columns = novos_cabecalhos
+                            df = dados_divididos.reset_index(drop=True)
+                            
+                except Exception as e:
+                    logger.warning(f"Tentando abordagem alternativa para: {nome_arquivo}")
+                    try:
+                        df_temp = pd.read_csv(
+                            StringIO(conteudo),
+                            sep='§',
+                            skiprows=8,
+                            encoding='latin-1',
+                            header=None,
+                            names=['dados_concatenados']
+                        )
+                        
+                        if not df_temp.empty and 'dados_concatenados' in df_temp.columns:
+                            dados_divididos = df_temp['dados_concatenados'].str.split(';', expand=True)
+                            if not dados_divididos.empty:
+                                novos_cabecalhos = dados_divididos.iloc[0].str.strip()
+                                dados_divididos = dados_divididos[1:]
+                                dados_divididos.columns = novos_cabecalhos
+                                df = dados_divididos.reset_index(drop=True)
+                    except Exception:
+                        return None
+            else:
+                df = pd.read_csv(
+                    StringIO(conteudo),
+                    sep=';',
+                    skiprows=8,
+                    decimal=',',
+                    encoding='latin-1',
+                    on_bad_lines='skip',
+                    header=0,
+                    low_memory=False
+                )
+            
+            mapeamento_colunas = {}
+            colunas_detectadas = list(df.columns)
+            
+            palavras_chave = {
+                'data': ['DATA', 'Data', 'data', 'DT_MEDICAO'],
+                'precipitacao': ['PRECIPITAÇÃO', 'PRECIPITACAO', 'Precipitacao', 'precipitacao', 'CHUVA', 'Chuva'],
+                'temperatura': ['TEMPERATURA', 'Temperatura', 'temperatura', 'BULBO SECO', 'BULBO_SECO', 'TEMPERATURA DO AR'],
+                'umidade': ['UMIDADE RELATIVA DO AR', 'UMIDADE_RELATIVA', 'UMIDADE RELATIVA', 'UMIDADE', 'Umidade', 'umidade', 'RELATIVA']
+            }
+            
+            for col_novo, palavras in palavras_chave.items():
+                for col_original in colunas_detectadas:
+                    col_original_str = str(col_original)
+                    if any(palavra.upper() in col_original_str.upper() for palavra in palavras):
+                        if col_novo == 'umidade' and 'HORARIA' in col_original_str.upper():
+                            mapeamento_colunas[col_original] = col_novo
+                            break
+                        elif col_novo not in [k for k, v in mapeamento_colunas.items() if v == col_novo]:
+                            mapeamento_colunas[col_original] = col_novo
+                            break
+            
+            if not mapeamento_colunas and formato_antigo:
+                mapeamentos_tentativas = [
+                    {
+                        'DATA (YYYY-MM-DD)': 'data',
+                        'PRECIPITAÇÃO TOTAL, HORÁRIO (mm)': 'precipitacao',
+                        'TEMPERATURA DO AR - BULBO SECO, HORARIA (°C)': 'temperatura',
+                    'UMIDADE RELATIVA DO AR, HORARIA (%)': 'umidade'
+                    },
+                    {
+                        'Data': 'data',
+                        'Precipitacao': 'precipitacao',
+                        'TempBulboSeco': 'temperatura',
+                        'UmidadeRelativa': 'umidade'
+                    }
+                ]
+                
+                for mapeamento in mapeamentos_tentativas:
+                    for col_original, col_novo in mapeamento.items():
+                        if col_original in colunas_detectadas:
+                            mapeamento_colunas[col_original] = col_novo
+            
+            if not mapeamento_colunas:
                 return None
-
+                
+            df = df.rename(columns=mapeamento_colunas)
+            
+            colunas_relevantes = ['data', 'precipitacao', 'temperatura', 'umidade']
+            colunas_existentes = [col for col in colunas_relevantes if col in df.columns]
+            
+            if 'data' not in colunas_existentes:
+                return None
+                
             df = df[colunas_existentes]
-
-            df['data'] = pd.to_datetime(df['data'], format='%Y/%m/%d', errors='coerce')
+            
+            if formato_antigo:
+                df['data'] = pd.to_datetime(df['data'], errors='coerce', format='%Y-%m-%d')
+                if df['data'].isnull().all():
+                    df['data'] = pd.to_datetime(df['data'], errors='coerce', dayfirst=True)
+                if df['data'].isnull().all():
+                    df['data'] = pd.to_datetime(df['data'], errors='coerce', format='%d/%m/%Y')
+            else:
+                df['data'] = pd.to_datetime(df['data'], errors='coerce', dayfirst=False)
+            
             df = df.dropna(subset=['data'])
+            
             df = df[df['data'].dt.year == ano_alvo]
-
+            
             if df.empty:
                 return None
-
+                
+            for coluna in ['precipitacao', 'temperatura', 'umidade']:
+                if coluna in df.columns:
+                    serie_limpa = df[coluna].astype(str)
+                    serie_limpa = serie_limpa.str.replace(r'[^\d\.,\-]', '', regex=True)
+                    serie_limpa = serie_limpa.str.replace(',', '.')
+                    df[coluna] = pd.to_numeric(serie_limpa, errors='coerce')
+                    
+                    if coluna == 'temperatura':
+                        df = df[(df[coluna] >= -50) & (df[coluna] <= 50)]
+                    elif coluna == 'precipitacao':
+                        df = df[(df[coluna] >= 0) & (df[coluna] <= 500)]
+                    elif coluna == 'umidade':
+                        df = df[(df[coluna] >= 0) & (df[coluna] <= 100)]
+            
+            if df.empty:
+                return None
+                
             df['ano_mes'] = df['data'].dt.to_period('M')
             
             agg_dict = {}
-            if 'precipitacao_mm' in df.columns:
-                agg_dict['precipitacao_mm'] = 'sum'
-            if 'temperatura_c' in df.columns:
-                agg_dict['temperatura_c'] = 'mean'
-            if 'umidade_percentual' in df.columns:
-                agg_dict['umidade_percentual'] = 'mean'
-            
+            if 'precipitacao' in df.columns:
+                agg_dict['precipitacao'] = 'sum'
+            if 'temperatura' in df.columns:
+                agg_dict['temperatura'] = 'mean'
+            if 'umidade' in df.columns:
+                agg_dict['umidade'] = 'mean'
+                
             if not agg_dict:
-                logger.warning(f"Nenhuma variável climática para agregar em {nome_arquivo}")
                 return None
-
+                
             df_mensal = df.groupby('ano_mes').agg(agg_dict).reset_index()
-
+            
+            df_mensal = df_mensal.rename(columns={
+                'precipitacao': 'precipitacao_mm',
+                'temperatura': 'temperatura_c',
+                'umidade': 'umidade_percentual'
+            })
+            
             regiao = ClimateDataProcessor.extrair_regiao(nome_arquivo)
             df_mensal['regiao'] = regiao
             df_mensal['estacao'] = nome_arquivo
-
+            
             return df_mensal
 
         except Exception as e:
-            logger.error(f"Erro ao processar {nome_arquivo} com pd.read_csv: {e}")
+            logger.error(f"Erro ao processar {nome_arquivo}: {e}")
             return None
     
     @staticmethod
